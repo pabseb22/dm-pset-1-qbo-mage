@@ -1,0 +1,114 @@
+from datetime import datetime, timedelta, timezone
+from dateutil.parser import isoparse
+import base64
+import time
+import requests
+
+def _get_secret(key: str) -> str:
+    import os
+    v = os.getenv(key)
+    if not v:
+        raise ValueError(f"Missing secret: {key}")
+    return v
+
+def _refresh_access_token():
+    client_id = _get_secret("QBO_CLIENT_ID")
+    client_secret = _get_secret("QBO_CLIENT_SECRET")
+    refresh_token = _get_secret("QBO_REFRESH_TOKEN")
+
+    url = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+    basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    headers = {
+        "Authorization": f"Basic {basic}",
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    data = {"grant_type": "refresh_token", "refresh_token": refresh_token}
+    r = requests.post(url, headers=headers, data=data, timeout=30)
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+def _qbo_query(access_token: str, realm_id: str, query: str, minorversion: int = 65):
+    url = f"https://quickbooks.api.intuit.com/v3/company/{realm_id}/query?minorversion={minorversion}"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/text",
+    }
+    r = requests.post(url, headers=headers, data=query, timeout=60)
+    if r.status_code in (429, 500, 502, 503, 504):
+        time.sleep(2)
+        r = requests.post(url, headers=headers, data=query, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+def _to_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def _iter_daily_windows(start_utc: datetime, end_utc: datetime):
+    cur = start_utc
+    while cur < end_utc:
+        nxt = min(cur + timedelta(days=1), end_utc)
+        yield cur, nxt
+        cur = nxt
+
+@data_loader
+def extract_customers(*args, **kwargs):
+    """
+    Params expected in Mage run:
+      - start_utc: ISO-8601 (e.g., 2025-01-01T00:00:00Z)
+      - end_utc:   ISO-8601
+      - page_size: int (optional)
+    """
+    realm_id = _get_secret("QBO_REALM_ID")
+    start_str = kwargs.get("start_utc")
+    end_str = kwargs.get("end_utc")
+    if not start_str or not end_str:
+        raise ValueError("Missing params: start_utc, end_utc")
+
+    start_utc = _to_utc(isoparse(start_str))
+    end_utc = _to_utc(isoparse(end_str))
+    page_size = int(kwargs.get("page_size", 200))
+
+    access_token = _refresh_access_token()
+    rows = []
+
+    for w_start, w_end in _iter_daily_windows(start_utc, end_utc):
+        w_start_s = w_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+        w_end_s = w_end.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        start_pos = 1
+        page_number = 1
+
+        while True:
+            query = (
+                "SELECT * FROM Customer "
+                f"WHERE Metadata.LastUpdatedTime >= '{w_start_s}' "
+                f"AND Metadata.LastUpdatedTime < '{w_end_s}' "
+                f"STARTPOSITION {start_pos} MAXRESULTS {page_size}"
+            )
+
+            payload = _qbo_query(access_token, realm_id, query)
+            customers = (payload.get("QueryResponse", {}) or {}).get("Customer", []) or []
+
+            for c in customers:
+                cid = str(c.get("Id"))
+                rows.append({
+                    "id": cid,
+                    "payload": c,
+                    "extract_window_start_utc": w_start_s,
+                    "extract_window_end_utc": w_end_s,
+                    "page_number": page_number,
+                    "page_size": page_size,
+                    "request_payload": {"query": query},
+                })
+
+            if len(customers) < page_size:
+                break
+
+            start_pos += page_size
+            page_number += 1
+
+    return rows

@@ -1,0 +1,70 @@
+services:
+  postgres:
+    image: postgres:13
+    container_name: dm_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: warehouse
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db/data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d warehouse"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: dm_pgadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    volumes:
+      - ./pgadmin/data:/var/lib/pgadmin
+
+  mage:
+    image: mageai/mageai
+    container_name: dm_mage
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "6789:6789"
+    environment:
+      MAGE_DATA_DIR: /home/src
+    volumes:
+      - ./mage/state:/home/src
+      - ./mage/mage_project:/home/src/mage_project
+    command: >
+      /bin/sh -c "mage start mage_project"
+  
+  mage_customers_trigger:
+    image: curlimages/curl:8.5.0
+    container_name: dm_mage_customers_trigger
+    depends_on:
+      mage:
+        condition: service_started
+    command: >
+      sh -c "
+      echo 'Waiting for Mage...' &&
+      sleep 15 &&
+      curl -X POST http://localhost:6789/api/pipeline_schedules/1/pipeline_runs/2ad9042e35ec48a9bf2f952fe7b76ba7
+        -H 'Content-Type: application/json'
+        -d '{
+          \"variables\": {
+            \"start_utc\": \"2025-01-01T00:00:00Z\",
+            \"end_utc\": \"2025-01-03T00:00:00Z\",
+            \"page_size\": 200
+          }
+        }'
+      "
+

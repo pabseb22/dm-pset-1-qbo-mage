@@ -1,0 +1,109 @@
+import os
+import json
+import psycopg2
+from psycopg2.extras import execute_values
+
+from mage_ai.settings.repo import get_repo_path
+from mage_ai.io.config import ConfigFileLoader
+from mage_ai.io.postgres import Postgres
+from pandas import DataFrame
+from os import path
+
+if 'data_exporter' not in globals():
+    from mage_ai.data_preparation.decorators import data_exporter
+
+
+def _require_env(key: str) -> str:
+    """
+    Read required Postgres connection info from Mage Secrets (env vars).
+    """
+    val = os.getenv(key)
+    if not val:
+        raise ValueError(f"Missing required secret: {key}")
+    return val
+
+
+@data_exporter
+def export_data_to_postgres(df: DataFrame, **kwargs) -> None:
+    """
+    Export (UPSERT) data into Postgres RAW table: raw.qb_customers.
+
+    Why not `loader.export(if_exists='replace')`?
+    - The assignment requires idempotency and upsert behavior (no duplicates).
+    - Replacing would drop/overwrite the entire table, which is not desired for incremental backfills.
+
+    Input:
+      df columns expected:
+        - id (text)
+        - payload (json string)
+        - extract_window_start_utc (ISO string)
+        - extract_window_end_utc (ISO string)
+        - page_number (int)
+        - page_size (int)
+        - request_payload (json string)
+
+    Output:
+      None (writes to Postgres).
+    """
+    # Keep these variables so your template structure remains recognizable
+    schema_name = 'raw'
+    table_name = 'qb_customers'
+
+    # NOTE: We do not rely on io_config.yaml for credentials because the project
+    # requirement is to use Mage Secrets. Secrets are read from env vars.
+    host = _require_env("POSTGRES_HOST")
+    port = int(_require_env("POSTGRES_PORT"))
+    db = _require_env("POSTGRES_DB")
+    user = _require_env("POSTGRES_USER")
+    password = _require_env("POSTGRES_PASSWORD")
+
+    if df is None or df.empty:
+        # Nothing to write (valid state for a date window with no updates)
+        return
+
+    # Prepare rows for batch upsert
+    values = []
+    for row in df.to_dict(orient="records"):
+        values.append((
+            str(row["id"]),
+            row["payload"],  # json string -> cast in SQL to jsonb
+            row["extract_window_start_utc"],
+            row["extract_window_end_utc"],
+            int(row["page_number"]),
+            int(row["page_size"]),
+            row.get("request_payload"),
+        ))
+
+    upsert_sql = f"""
+    INSERT INTO {schema_name}.{table_name}
+      (id, payload, extract_window_start_utc, extract_window_end_utc, page_number, page_size, request_payload)
+    VALUES %s
+    ON CONFLICT (id) DO UPDATE SET
+      payload = EXCLUDED.payload::jsonb,
+      ingested_at_utc = now(),
+      extract_window_start_utc = EXCLUDED.extract_window_start_utc,
+      extract_window_end_utc = EXCLUDED.extract_window_end_utc,
+      page_number = EXCLUDED.page_number,
+      page_size = EXCLUDED.page_size,
+      request_payload = EXCLUDED.request_payload::jsonb;
+    """
+
+    conn = psycopg2.connect(
+        host=host,
+        port=port,
+        dbname=db,
+        user=user,
+        password=password,
+    )
+    conn.autocommit = False
+
+    try:
+        with conn.cursor() as cur:
+            # execute_values inserts in bulk efficiently
+            execute_values(cur, upsert_sql, values, page_size=500)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

@@ -1,0 +1,165 @@
+import json
+import psycopg2
+from psycopg2.extras import execute_values, Json
+from pandas import DataFrame
+from datetime import datetime, timezone
+
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+
+if 'data_exporter' not in globals():
+    from mage_ai.data_preparation.decorators import data_exporter
+
+
+def _require_secret(key: str) -> str:
+    val = get_secret_value(key)
+    if not val:
+        raise ValueError(f"Missing required Mage Secret: {key}")
+    return val
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _safe_json(value):
+    """
+    Ensures we store JSONB correctly:
+    - if value is dict/list -> keep
+    - if value is JSON string -> json.loads
+    - if None/empty -> None
+    """
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            return json.loads(s)
+        except json.JSONDecodeError:
+            # If it isn't valid JSON, store as a string field in JSON
+            return {"_raw": value}
+    # fallback
+    return {"_raw": str(value)}
+
+
+@data_exporter
+def export_data_to_postgres(df: DataFrame, **kwargs) -> None:
+    """
+    Upsert into Postgres RAW table: raw.qb_customers
+
+    Required by spec:
+    - payload completo (JSONB)
+    - metadatos: ingested_at_utc, extract_window_start_utc/end_utc, page_number/page_size, request_payload
+    - idempotencia: upsert por PK (id)
+    - logging claro
+    """
+    schema_name = "raw"
+    table_name = "qb_customers"
+    full_table = f"{schema_name}.{table_name}"
+
+    # Read Postgres creds from Mage Secrets (per assignment)
+    host = _require_secret("POSTGRES_HOST")
+    port = int(_require_secret("POSTGRES_PORT"))
+    db = _require_secret("POSTGRES_DB")
+    user = _require_secret("POSTGRES_USER")
+    password = _require_secret("POSTGRES_PASSWORD")
+
+    run_ts = _utc_now_iso()
+
+    # ---- Logs: start ----
+    if df is None:
+        print(f"[{run_ts}] EXPORTER | {full_table} | df=None (nothing to write)")
+        return
+
+    row_count = int(df.shape[0])
+    print(f"[{run_ts}] EXPORTER | {full_table} | rows_received={row_count}")
+
+    if row_count == 0:
+        print(f"[{run_ts}] EXPORTER | {full_table} | empty dataframe (valid state)")
+        return
+
+    # Quick sanity check for required columns
+    required_cols = {
+        "id",
+        "payload",
+        "extract_window_start_utc",
+        "extract_window_end_utc",
+        "page_number",
+        "page_size",
+        "request_payload",
+    }
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Exporter missing required columns: {missing}")
+
+    # Show a tiny preview for observability (no secrets here)
+    sample_ids = df["id"].astype(str).head(3).tolist()
+    print(f"[{run_ts}] EXPORTER | sample_ids={sample_ids}")
+
+    # ---- Prepare values ----
+    values = []
+    for r in df.to_dict(orient="records"):
+        values.append((
+            str(r["id"]),
+            Json(_safe_json(r["payload"])),                 # JSONB
+            r["extract_window_start_utc"],
+            r["extract_window_end_utc"],
+            int(r["page_number"]),
+            int(r["page_size"]),
+            Json(_safe_json(r.get("request_payload"))),     # JSONB
+        ))
+
+    # ---- Ensure table exists (optional but very helpful) ----
+    create_sql = f"""
+    CREATE SCHEMA IF NOT EXISTS {schema_name};
+
+    CREATE TABLE IF NOT EXISTS {full_table} (
+      id TEXT PRIMARY KEY,
+      payload JSONB NOT NULL,
+      ingested_at_utc TIMESTAMPTZ NOT NULL DEFAULT timezone('utc', now()),
+      extract_window_start_utc TEXT NOT NULL,
+      extract_window_end_utc   TEXT NOT NULL,
+      page_number INT NOT NULL,
+      page_size   INT NOT NULL,
+      request_payload JSONB
+    );
+    """
+
+    upsert_sql = f"""
+    INSERT INTO {full_table}
+      (id, payload, ingested_at_utc, extract_window_start_utc, extract_window_end_utc, page_number, page_size, request_payload)
+    VALUES %s
+    ON CONFLICT (id) DO UPDATE SET
+      payload = EXCLUDED.payload,
+      ingested_at_utc = timezone('utc', now()),
+      extract_window_start_utc = EXCLUDED.extract_window_start_utc,
+      extract_window_end_utc = EXCLUDED.extract_window_end_utc,
+      page_number = EXCLUDED.page_number,
+      page_size = EXCLUDED.page_size,
+      request_payload = EXCLUDED.request_payload;
+    """
+
+    # ---- Write ----
+    conn = psycopg2.connect(
+        host=host, port=port, dbname=db, user=user, password=password
+    )
+    conn.autocommit = False
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(create_sql)
+
+            # Bulk upsert
+            execute_values(cur, upsert_sql, values, page_size=500)
+
+        conn.commit()
+        print(f"[{_utc_now_iso()}] EXPORTER | {full_table} | upsert_ok | rows_written={row_count}")
+    except Exception as e:
+        conn.rollback()
+        print(f"[{_utc_now_iso()}] EXPORTER | {full_table} | ERROR -> rollback")
+        raise
+    finally:
+        conn.close()

@@ -1,0 +1,133 @@
+import base64
+import json
+import pandas as pd
+import requests
+
+from mage_ai.data_preparation.shared.secrets import get_secret_value
+
+if 'data_loader' not in globals():
+    from mage_ai.data_preparation.decorators import data_loader
+if 'test' not in globals():
+    from mage_ai.data_preparation.decorators import test
+
+
+def _require_secret(key: str) -> str:
+    val = get_secret_value(key)
+    if not val:
+        raise ValueError(f"Missing required Mage Secret: {key}")
+    return val
+
+
+def _get_base_url() -> str:
+    env = _require_secret("QBO_ENV").strip().lower()
+    if env == "sandbox":
+        return "https://sandbox-quickbooks.api.intuit.com"
+    if env in ("prod", "production"):
+        return "https://quickbooks.api.intuit.com"
+    raise ValueError("QBO_ENV must be 'sandbox' or 'prod'/'production'")
+
+
+def _refresh_access_token() -> dict:
+    """
+    Refresh token -> access token.
+    Returns full token payload (access_token + maybe new refresh_token).
+    """
+    client_id = _require_secret("QBO_CLIENT_ID")
+    client_secret = _require_secret("QBO_CLIENT_SECRET")
+    refresh_token = _require_secret("QBO_REFRESH_TOKEN")
+
+    token_url = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+    basic = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("utf-8")
+
+    headers = {
+        "Authorization": f"Basic {basic}",
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+
+    r = requests.post(token_url, headers=headers, data=data, timeout=30)
+    if not r.ok:
+        raise RuntimeError(f"Token refresh failed: {r.status_code}\n{r.text}")
+    return r.json()
+
+
+def _qbo_query(access_token: str, realm_id: str, query: str, minorversion: str = "75") -> dict:
+    """
+    QBO SQL-like query endpoint (GET with query param).
+    """
+    base_url = _get_base_url()
+    url = f"{base_url}/v3/company/{realm_id}/query"
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+    }
+    params = {
+        "query": query,
+        "minorversion": minorversion,
+    }
+
+    r = requests.get(url, headers=headers, params=params, timeout=30)
+    if not r.ok:
+        raise RuntimeError(
+            f"QBO query failed: {r.status_code}\n"
+            f"URL: {r.url}\n"
+            f"Body: {r.text}"
+        )
+    return r.json()
+
+
+@data_loader
+def load_data_from_api(*args, **kwargs):
+    """
+    Smoke test:
+    - Refresh token -> access token
+    - Query 1 Customer
+    - Return a tiny DataFrame to confirm data exists
+    """
+    realm_id = _require_secret("QBO_REALM_ID")
+
+    token_payload = _refresh_access_token()
+    access_token = token_payload["access_token"]
+
+    # Importante: a veces Intuit devuelve refresh_token nuevo
+    new_refresh_token = token_payload.get("refresh_token")
+    if new_refresh_token:
+        old_refresh_token = _require_secret("QBO_REFRESH_TOKEN")
+        if new_refresh_token != old_refresh_token:
+            print("⚠️ Intuit returned a NEW refresh token.")
+            print("👉 Update your Mage Secret QBO_REFRESH_TOKEN to avoid future failures.")
+
+    # Query más simple para verificar que hay datos
+    payload = _qbo_query(access_token, realm_id, "SELECT * FROM Customer MAXRESULTS 1")
+
+    customers = (payload.get("QueryResponse", {}) or {}).get("Customer", []) or []
+    if not customers:
+        # Puede pasar si la empresa está vacía (raro en sandbox, pero posible)
+        print("✅ Auth OK, but no Customers returned.")
+        return pd.DataFrame([{
+            "status": "ok_no_data",
+            "note": "Authenticated but Customer query returned 0 rows.",
+            "raw_response": json.dumps(payload),
+        }])
+
+    c = customers[0]
+    return pd.DataFrame([{
+        "status": "ok",
+        "customer_id": str(c.get("Id")),
+        "display_name": c.get("DisplayName"),
+        "active": c.get("Active"),
+        "payload": json.dumps(c),
+    }])
+
+
+@test
+def test_output(output, *args) -> None:
+    assert output is not None, "Output is undefined"
+    assert hasattr(output, "shape"), "Output is not a DataFrame-like object"
+    assert output.shape[0] >= 1, "No rows returned (unexpected for smoke test)"
+    assert "status" in output.columns, "Missing expected column: status"
