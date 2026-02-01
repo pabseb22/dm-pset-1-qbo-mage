@@ -27,7 +27,7 @@ def _to_json(x):
 @data_exporter
 def export_data_to_postgres(df: DataFrame, **kwargs) -> None:
     schema = "raw"
-    table = "qb_customers"
+    table = "qb_invoices"
 
     if df is None or df.empty:
         print("No rows to export.")
@@ -39,28 +39,15 @@ def export_data_to_postgres(df: DataFrame, **kwargs) -> None:
     user = _require_secret("POSTGRES_USER")
     password = _require_secret("POSTGRES_PASSWORD")
 
-    # Deduplicate inside batch
-    df2 = df.sort_values(
-        ["extract_window_end_utc", "page_number"]
-    ).drop_duplicates(subset=["id"], keep="last")
-
+    df2 = df.sort_values(["extract_window_end_utc", "page_number"]).drop_duplicates(subset=["id"], keep="last")
     ids = df2["id"].tolist()
 
-    conn = psycopg2.connect(
-        host=host,
-        port=port,
-        dbname=db,
-        user=user,
-        password=password,
-    )
+    conn = psycopg2.connect(host=host, port=port, dbname=db, user=user, password=password)
     conn.autocommit = False
 
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                f"SELECT id FROM {schema}.{table} WHERE id = ANY(%s)",
-                (ids,),
-            )
+            cur.execute(f"SELECT id FROM {schema}.{table} WHERE id = ANY(%s)", (ids,))
             existing_ids = {row[0] for row in cur.fetchall()}
 
             inserted = 0
@@ -101,11 +88,7 @@ def export_data_to_postgres(df: DataFrame, **kwargs) -> None:
             execute_values(cur, upsert_sql, values, page_size=500)
 
         conn.commit()
-
-        print(
-            f"Export completed | inserted={inserted} "
-            f"updated={updated} total={len(values)}"
-        )
+        print(f"Export completed | inserted={inserted} updated={updated} total={len(values)}")
 
     except Exception:
         conn.rollback()

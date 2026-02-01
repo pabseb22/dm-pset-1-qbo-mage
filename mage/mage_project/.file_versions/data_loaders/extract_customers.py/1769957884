@@ -80,28 +80,15 @@ def _refresh_access_token() -> str:
         "Accept": "application/json",
         "Content-Type": "application/x-www-form-urlencoded",
     }
-    data = {"grant_type": "refresh_token", "refresh_token": refresh_token}
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
 
     response = requests.post(token_url, headers=headers, data=data, timeout=30)
-
     if not response.ok:
-        try:
-            err = response.json()
-            code = err.get("error")
-            desc = err.get("error_description", "")
-        except Exception:
-            code = None
-            desc = response.text
-
-        if code == "invalid_grant":
-            raise RuntimeError(
-                "Token refresh failed: invalid_grant. "
-                "El refresh token es inválido/expiró o no corresponde al entorno/app. "
-                "Actualiza el secret QBO_REFRESH_TOKEN."
-            )
-
         raise RuntimeError(
-            f"Token refresh failed ({response.status_code}): {desc}"
+            f"Token refresh failed ({response.status_code}): {response.text}"
         )
 
     return response.json()["access_token"]

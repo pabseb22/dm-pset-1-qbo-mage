@@ -9,3 +9,6 @@ CREATE TABLE IF NOT EXISTS raw.qb_items (
   request_payload JSONB
 );
 CREATE INDEX IF NOT EXISTS idx_qb_items_ingested_at ON raw.qb_items (ingested_at_utc);
+
+CREATE INDEX IF NOT EXISTS idx_qb_items_window
+ON raw.qb_items (extract_window_start_utc, extract_window_end_utc);

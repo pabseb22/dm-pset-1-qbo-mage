@@ -15,7 +15,7 @@ blocks:
   type: data_loader
   upstream_blocks: []
   uuid: extract_customers
-- all_upstream_blocks_executed: false
+- all_upstream_blocks_executed: true
   color: null
   configuration: {}
   downstream_blocks: []
@@ -25,7 +25,7 @@ blocks:
   language: python
   name: upsert_customers_to_postgres
   retry_config: null
-  status: updated
+  status: executed
   timeout: null
   type: data_exporter
   upstream_blocks:

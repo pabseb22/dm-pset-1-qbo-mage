@@ -25,10 +25,6 @@ RAW_COLUMNS = [
 ]
 
 
-# -------------------------------------------------------------------
-# Secrets and helpers
-# -------------------------------------------------------------------
-
 def _require_secret(key: str) -> str:
     value = get_secret_value(key)
     if not value:
@@ -61,19 +57,13 @@ def _iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# -------------------------------------------------------------------
-# OAuth
-# -------------------------------------------------------------------
-
 def _refresh_access_token() -> str:
     client_id = _require_secret("QBO_CLIENT_ID")
     client_secret = _require_secret("QBO_CLIENT_SECRET")
     refresh_token = _require_secret("QBO_REFRESH_TOKEN")
 
     token_url = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
-    basic = base64.b64encode(
-        f"{client_id}:{client_secret}".encode("utf-8")
-    ).decode("utf-8")
+    basic = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("utf-8")
 
     headers = {
         "Authorization": f"Basic {basic}",
@@ -100,16 +90,15 @@ def _refresh_access_token() -> str:
                 "Actualiza el secret QBO_REFRESH_TOKEN."
             )
 
-        raise RuntimeError(
-            f"Token refresh failed ({response.status_code}): {desc}"
-        )
+        raise RuntimeError(f"Token refresh failed ({response.status_code}): {desc}")
 
-    return response.json()["access_token"]
+    payload = response.json()
+    new_refresh = payload.get("refresh_token")
+    if new_refresh and new_refresh != refresh_token:
+        print("Se recibió un refresh token nuevo (rotación). Actualiza el secret QBO_REFRESH_TOKEN.")
 
+    return payload["access_token"]
 
-# -------------------------------------------------------------------
-# HTTP with retries, backoff and circuit breaker
-# -------------------------------------------------------------------
 
 def _qbo_request_with_retries(
     access_token: str,
@@ -121,10 +110,7 @@ def _qbo_request_with_retries(
     base_url = _get_base_url()
     url = f"{base_url}/v3/company/{realm_id}/query"
 
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
     params = {"query": query, "minorversion": minorversion}
 
     attempt = 0
@@ -139,48 +125,33 @@ def _qbo_request_with_retries(
 
         status = response.status_code
 
-        # 401: token expired → refresh once
         if status == 401 and attempt <= max_retries:
             print("Auth expired. Refreshing access token and retrying.")
             access_token = _refresh_access_token()
             headers["Authorization"] = f"Bearer {access_token}"
             continue
 
-        # Retryable errors
         if status in (429, 500, 502, 503, 504) and attempt <= max_retries:
             consecutive_failures += 1
             backoff = min(2 ** attempt, 30) + random.uniform(0, 1)
-            print(
-                f"Request failed ({status}). "
-                f"Retry {attempt}/{max_retries} in {backoff:.1f}s."
-            )
+            print(f"Request failed ({status}). Retry {attempt}/{max_retries} in {backoff:.1f}s.")
             time.sleep(backoff)
 
             if consecutive_failures >= max_retries:
-                raise RuntimeError(
-                    f"Circuit breaker opened after {consecutive_failures} failures."
-                )
+                raise RuntimeError(f"Circuit breaker opened after {consecutive_failures} failures.")
             continue
 
-        raise RuntimeError(
-            f"QBO request failed ({status}): {response.text}"
-        )
+        raise RuntimeError(f"QBO request failed ({status}): {response.text}")
 
 
-def _extract_customers(payload: dict) -> list:
-    return (
-        payload.get("QueryResponse", {}) or {}
-    ).get("Customer", []) or []
+def _extract_items(payload: dict) -> list:
+    return (payload.get("QueryResponse", {}) or {}).get("Item", []) or []
 
-
-# -------------------------------------------------------------------
-# Data loader
-# -------------------------------------------------------------------
 
 @data_loader
 def load_data_from_api(*args, **kwargs):
     """
-    Backfill histórico de Customers desde QuickBooks Online.
+    Backfill histórico de Items desde QuickBooks Online.
 
     Parámetros obligatorios (desde trigger):
       - fecha_inicio (ISO, UTC)
@@ -190,7 +161,6 @@ def load_data_from_api(*args, **kwargs):
       - page_size (int, default 200)
       - minorversion (str, default 75)
     """
-
     realm_id = _require_secret("QBO_REALM_ID")
     page_size = int(kwargs.get("page_size") or 200)
     minorversion = str(kwargs.get("minorversion") or "75")
@@ -200,7 +170,6 @@ def load_data_from_api(*args, **kwargs):
 
     extract_start = _parse_iso_utc(kwargs["fecha_inicio"])
     extract_end = _parse_iso_utc(kwargs["fecha_fin"])
-
     if extract_end <= extract_start:
         raise ValueError("fecha_fin debe ser mayor que fecha_inicio")
 
@@ -208,7 +177,6 @@ def load_data_from_api(*args, **kwargs):
     rows = []
 
     overall_start = datetime.now(timezone.utc)
-
     day_cursor = extract_start.replace(hour=0, minute=0, second=0, microsecond=0)
 
     while day_cursor < extract_end:
@@ -219,45 +187,39 @@ def load_data_from_api(*args, **kwargs):
         tramo_pages = 0
         tramo_rows = 0
 
-        print(
-            f"Processing Customers window "
-            f"{_iso_z(day_start)} → {_iso_z(day_end)}"
-        )
+        print(f"Processing Items window {_iso_z(day_start)} → {_iso_z(day_end)}")
 
         start_position = 1
         page_number = 1
 
         while True:
             query = (
-                "SELECT * FROM Customer "
+                "SELECT * FROM Item "
                 f"WHERE MetaData.LastUpdatedTime >= '{_iso_z(day_start)}' "
                 f"AND MetaData.LastUpdatedTime < '{_iso_z(day_end)}' "
                 f"STARTPOSITION {start_position} MAXRESULTS {page_size}"
             )
 
-            payload = _qbo_request_with_retries(
-                access_token, realm_id, query, minorversion
-            )
-            customers = _extract_customers(payload)
+            payload = _qbo_request_with_retries(access_token, realm_id, query, minorversion)
+            items = _extract_items(payload)
 
             tramo_pages += 1
 
             request_payload = {
-                "entity": "Customer",
+                "entity": "Item",
                 "query": query,
                 "minorversion": minorversion,
                 "realm_id": realm_id,
                 "env": _require_secret("QBO_ENV"),
             }
 
-            for customer in customers:
-                cid = customer.get("Id")
-                if not cid:
+            for item in items:
+                iid = item.get("Id")
+                if not iid:
                     continue
-
                 rows.append({
-                    "id": str(cid),
-                    "payload": json.dumps(customer),
+                    "id": str(iid),
+                    "payload": json.dumps(item),
                     "extract_window_start_utc": _iso_z(day_start),
                     "extract_window_end_utc": _iso_z(day_end),
                     "page_number": page_number,
@@ -266,7 +228,7 @@ def load_data_from_api(*args, **kwargs):
                 })
                 tramo_rows += 1
 
-            if len(customers) < page_size:
+            if len(items) < page_size:
                 break
 
             start_position += page_size
@@ -274,23 +236,19 @@ def load_data_from_api(*args, **kwargs):
 
         tramo_end = datetime.now(timezone.utc)
         tramo_duration = (tramo_end - tramo_start).total_seconds()
-
-        print(
-            f"Window completed | pages={tramo_pages} "
-            f"rows={tramo_rows} duration_s={tramo_duration:.2f}"
-        )
+        print(f"Window completed | pages={tramo_pages} rows={tramo_rows} duration_s={tramo_duration:.2f}")
 
         day_cursor += timedelta(days=1)
 
     overall_end = datetime.now(timezone.utc)
     overall_duration = (overall_end - overall_start).total_seconds()
 
-    print("==== QB CUSTOMERS BACKFILL SUMMARY ====")
+    print("==== QB ITEMS BACKFILL SUMMARY ====")
     print(f"window_start_utc={_iso_z(extract_start)}")
     print(f"window_end_utc={_iso_z(extract_end)}")
     print(f"total_rows={len(rows)}")
     print(f"duration_seconds={overall_duration:.2f}")
-    print("======================================")
+    print("==================================")
 
     return pd.DataFrame(rows, columns=RAW_COLUMNS)
 
