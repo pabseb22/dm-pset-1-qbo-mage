@@ -302,7 +302,27 @@ Verificar que los volúmenes Docker estén correctamente montados y que PostgreS
 
 ---
 
-## 14. Checklist de Aceptación
+## 14. PgAdmin
+
+PgAdmin se incluye como herramienta de soporte para inspeccionar y validar los datos
+cargados en PostgreSQL durante el backfill.
+
+- URL: http://localhost:5050
+- Usuario: admin@admin.com
+- Password: admin
+
+La conexión a PostgreSQL ya se encuentra preconfigurada mediante un archivo
+`servers.json` versionado en el repositorio. No es necesario crear servidores manualmente.
+
+PgAdmin utiliza un volumen Docker nombrado para persistir su configuración interna.
+Esto evita problemas de permisos comunes en entornos Windows al usar bind mounts.
+
+Al ingresar por primera vez, PgAdmin solicita definir un *Master Password*.
+Este password protege únicamente las contraseñas almacenadas en PgAdmin y
+no afecta la ejecución de los pipelines ni la gestión de secretos en Mage.
+
+
+## 15. Checklist de Aceptación
 
 ✔ Mage y Postgres se comunican por nombre de servicio.
 ✔ Todos los secretos están gestionados en Mage Secrets.
